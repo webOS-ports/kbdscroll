@@ -15,6 +15,16 @@
  * always wins: a key press during the slide, or just before it, cancels the
  * gesture.
  *
+ * Not every touchscreen has a slot to spare. One that speaks multitouch
+ * protocol A (no ABS_MT_SLOT at all - mtk-tpd on the Titan Pocket) or has a
+ * single slot carries one contact stream, and an injected contact written into
+ * it lands in the real finger's frames: the finger jumps to the drag's
+ * position, and the drag's lift lifts the finger. On such a screen the
+ * injection is written in the screen's own protocol, the screen is read as
+ * well, nothing is injected while a real finger is down, and a finger that
+ * lands mid-drag simply takes the stream over - nothing more is written, so
+ * the compositor sees the drag end where it was.
+ *
  * With the cursor modifier held (Alt by default) the same slide sends arrow
  * keys instead, which moves the text cursor a character or a line at a time.
  *
@@ -420,7 +430,10 @@ static void probe(const char *path)
 		int cy = d->mt ? ABS_MT_POSITION_Y : ABS_Y;
 		if (ioctl(fd, EVIOCGABS(cx), &ai) == 0) { d->min_x = ai.minimum; d->max_x = ai.maximum; }
 		if (ioctl(fd, EVIOCGABS(cy), &ai) == 0) { d->min_y = ai.minimum; d->max_y = ai.maximum; }
-		if (d->mt && ioctl(fd, EVIOCGABS(ABS_MT_SLOT), &ai) == 0)
+		/* The bit first: EVIOCGABS answers for any axis, with zeros
+		 * for one the device does not have, which reads as one slot. */
+		if (d->mt && test_bit(ABS_MT_SLOT, abs) &&
+		    ioctl(fd, EVIOCGABS(ABS_MT_SLOT), &ai) == 0)
 			d->slots = ai.maximum;
 	}
 	close(fd);
@@ -498,6 +511,11 @@ static struct indev *find(const char *spec, int want_pointer)
 /* -------------------------------------------------------------- the devices */
 
 static int scr_fd = -1, scr_w, scr_h, inj_slot = 9;
+/* The screen carries one contact stream (protocol A, or a single slot), so
+ * the injected contact and a real finger cannot both be down - see the notes at
+ * the top. scr_typea: write protocol A frames. real_down: a real finger is on
+ * the glass, as read back from the screen by scr_event(). */
+static int scr_shared, scr_typea, real_down;
 static int arrow_fd = -1, keys_wfd = -1;
 static int uinput_scr_fd = -1, uinput_key_fd = -1;
 static long long own_keys_until;
@@ -588,11 +606,41 @@ static void emit(int fd, int type, int code, int value)
 }
 
 static int inj_down;
+static int inj_x0, inj_y0, inj_lx, inj_ly;	/* where it came down, where it is */
+
+/* Screen pixels an injected contact must have moved before it may lift: a
+ * contact that goes down and up on the spot is a tap to the shell. */
+static int tap_guard(void)
+{
+	return scr_h / 24 > 16 ? scr_h / 24 : 16;
+}
 
 static void inj_touch(int x, int y)
 {
 	if (scr_fd < 0)
 		return;
+	/* The stream belongs to the finger on the glass. */
+	if (scr_shared && real_down)
+		return;
+	if (!inj_down) { inj_x0 = x; inj_y0 = y; }
+	inj_lx = x;
+	inj_ly = y;
+	if (scr_typea) {
+		/* Protocol A: the frame lists every contact that is down, each
+		 * closed by SYN_MT_REPORT; one that is missing from a frame has
+		 * lifted. The kernel does not filter repeated values here, so
+		 * the step-off below is not needed. */
+		emit(scr_fd, EV_ABS, ABS_MT_TRACKING_ID, INJ_ID);
+		emit(scr_fd, EV_ABS, ABS_MT_TOUCH_MAJOR, 8);
+		emit(scr_fd, EV_ABS, ABS_MT_POSITION_X, x);
+		emit(scr_fd, EV_ABS, ABS_MT_POSITION_Y, y);
+		emit(scr_fd, EV_SYN, SYN_MT_REPORT, 0);
+		if (!inj_down)
+			emit(scr_fd, EV_KEY, BTN_TOUCH, 1);
+		emit(scr_fd, EV_SYN, SYN_REPORT, 0);
+		inj_down = 1;
+		return;
+	}
 	emit(scr_fd, EV_ABS, ABS_MT_SLOT, inj_slot);
 	if (!inj_down) {
 		emit(scr_fd, EV_ABS, ABS_MT_TRACKING_ID, INJ_ID);
@@ -615,16 +663,127 @@ static void inj_touch(int x, int y)
 	inj_down = 1;
 }
 
+/* A real finger has taken the stream: forget the injected contact without
+ * writing anything. A lift now would lift the finger; the finger's own frames
+ * already end the drag for the compositor. */
+static void inj_abandon(void)
+{
+	inj_down = 0;
+}
+
 static void inj_up(void)
 {
 	if (!inj_down || scr_fd < 0)
 		return;
+	/* A finger on a shared stream owns it: writing a lift would lift it. */
+	if (scr_shared && real_down) {
+		inj_abandon();
+		return;
+	}
+	/* Never end as a tap: a drag that is let go almost where it came down
+	 * is first carried on in the direction it was going (down if it has
+	 * none). */
+	int dx = inj_lx - inj_x0, dy = inj_ly - inj_y0, g = tap_guard();
+	if (abs(dx) < g && abs(dy) < g) {
+		int nx = inj_x0, ny = inj_y0;
+		if (abs(dx) > abs(dy))
+			nx += dx < 0 ? -g : g;
+		else
+			ny += dy < 0 ? -g : g;
+		if (nx < 0) nx = inj_x0 + g;
+		if (nx >= scr_w) nx = inj_x0 - g;
+		if (ny < 0) ny = inj_y0 + g;
+		if (ny >= scr_h) ny = inj_y0 - g;
+		inj_touch(nx, ny);
+	}
+	if (scr_typea) {
+		/* An empty frame: nothing is down. */
+		emit(scr_fd, EV_KEY, BTN_TOUCH, 0);
+		emit(scr_fd, EV_SYN, SYN_MT_REPORT, 0);
+		emit(scr_fd, EV_SYN, SYN_REPORT, 0);
+		inj_down = 0;
+		return;
+	}
 	emit(scr_fd, EV_ABS, ABS_MT_SLOT, inj_slot);
 	emit(scr_fd, EV_ABS, ABS_MT_TRACKING_ID, -1);
 	emit(scr_fd, EV_KEY, BTN_TOUCH, 0);
 	emit(scr_fd, EV_KEY, BTN_TOOL_FINGER, 0);
 	emit(scr_fd, EV_SYN, SYN_REPORT, 0);
 	inj_down = 0;
+}
+
+
+/* A vertical drag. A long slide is taller than the screen, so near its edge
+ * the contact lets go (the page flings on) and a new one takes hold
+ * mid-screen. Not at once: the new contact comes down only once the finger
+ * has moved a slop further, and already moved by that much. Put down at once,
+ * a finger that stopped or lifted there left a touch-and-release in the
+ * middle of the page - a tap. */
+static int vy_anchor, vy_pad, vy_regrab;
+
+static void drag_y_start(int pad_y0)
+{
+	vy_anchor = scr_h / 2;
+	vy_pad = pad_y0;
+	vy_regrab = 0;
+	inj_touch(scr_w / 2, vy_anchor);
+}
+
+static void drag_y(int pad_y)
+{
+	if (vy_regrab) {
+		if (abs(pad_y - vy_pad) < o_slop)
+			return;
+		vy_regrab = 0;
+		inj_touch(scr_w / 2, vy_anchor);
+	}
+	int ty = vy_anchor + (int)((pad_y - vy_pad) * o_scale);
+	if (ty < scr_h / EDGE_DIV || ty > scr_h - scr_h / EDGE_DIV) {
+		inj_up();
+		vy_pad = pad_y;
+		vy_regrab = 1;
+		return;
+	}
+	inj_touch(scr_w / 2, ty);
+}
+
+
+/* Follow the screen's real contacts on a shared stream. Our own frames come
+ * back here too and are told apart by INJ_ID. A protocol A frame counts the
+ * contacts closed by SYN_MT_REPORT that carried a position; the lift is an empty
+ * one (BTN_TOUCH 0, a bare SYN_MT_REPORT), and a frame holding only ours means
+ * no real finger either. A protocol B screen's one slot is real while it holds
+ * a tracking id that is not ours. */
+static void scr_event(const struct input_event *e)
+{
+	static int cur_id = -1, cur_pos, nreal, slot;
+
+	if (scr_typea) {
+		if (e->type == EV_ABS && e->code == ABS_MT_TRACKING_ID)
+			cur_id = e->value;
+		else if (e->type == EV_ABS &&
+			 (e->code == ABS_MT_POSITION_X || e->code == ABS_MT_POSITION_Y))
+			cur_pos = 1;
+		else if (e->type == EV_SYN && e->code == SYN_MT_REPORT) {
+			if (cur_pos && cur_id != INJ_ID)
+				nreal++;
+			cur_id = -1;
+			cur_pos = 0;
+		} else if (e->type == EV_SYN && e->code == SYN_REPORT) {
+			real_down = nreal > 0;
+			nreal = 0;
+			cur_id = -1;
+			cur_pos = 0;
+		}
+		return;
+	}
+	if (e->type != EV_ABS)
+		return;
+	if (e->code == ABS_MT_SLOT)
+		slot = e->value;
+	else if (e->code == ABS_MT_TRACKING_ID && slot == inj_slot) {
+		real_down = e->value >= 0 && e->value != INJ_ID;
+	}
 }
 
 static void tap_key(int fd, int code)
@@ -752,7 +911,8 @@ static void list_devices(const struct indev *pad, const struct indev *scr,
 		size_t n = 0;
 		#define cap(fmt, ...) do { if (n < sizeof caps - 1) \
 			n += snprintf(caps + n, sizeof caps - n, fmt, ##__VA_ARGS__); } while (0)
-		if (d->mt) cap("multitouch(%d slots) ", d->slots + 1);
+		if (d->mt && d->slots < 0) cap("multitouch(protocol A) ");
+		else if (d->mt) cap("multitouch(%d slots) ", d->slots + 1);
 		if (d->st) cap("single-touch ");
 		if (d->mt || d->st) cap("%dx%d ", width(d), height(d));
 		else if (d->rel && d->max_x) cap("%dx%d virtual ", width(d), height(d));
@@ -814,7 +974,7 @@ int main(int argc, char **argv)
 	struct indev *keyd[MAX_KEYDEVS];
 	int nkeyd = 0, key_fd[MAX_KEYDEVS], listing = 0;
 	int cursor_mod[4], ncursor_mod;
-	int pad_fd = -1;
+	int pad_fd = -1, scr_rfd = -1;
 	const char *conf = "/etc/kbdscroll.conf";
 
 	/* Configuration, in order of increasing precedence. */
@@ -928,6 +1088,12 @@ int main(int argc, char **argv)
 		if (scr->slots >= 0)
 			inj_slot = scr->slots;
 	}
+	/* Injecting into the screen's own node, which has no slot of its own to
+	 * spare: see the notes at the top. A virtual screen of ours always has. */
+	if (scr && strcmp(o_screen, "uinput")) {
+		scr_typea = scr->slots < 0;
+		scr_shared = scr->slots <= 0;
+	}
 	if (*o_screen_size)
 		sscanf(o_screen_size, "%dx%d", &scr_w, &scr_h);
 	if (scr_w <= 1 || scr_h <= 1) { scr_w = 1080; scr_h = 1920; }
@@ -999,6 +1165,17 @@ int main(int argc, char **argv)
 			note("kbdscroll: %s: %s; falling back to a virtual touchscreen\n",
 			     scr->path, strerror(errno));
 		scr_fd = uinput_scr_fd = uinput_dev("kbdscroll touch", 1, scr_w, scr_h, &inj_slot);
+		scr_shared = scr_typea = 0;
+	}
+	if (scr_shared) {
+		scr_rfd = open(scr->path, O_RDONLY | O_NONBLOCK);
+		if (scr_rfd < 0) {
+			/* Without it a finger on the glass cannot be seen, and an
+			 * injected drag would fight it: not worth it. */
+			note("kbdscroll: %s: %s; cannot follow the finger on a "
+			     "single-contact screen, giving up\n", scr->path, strerror(errno));
+			return 1;
+		}
 	}
 	if (scr_fd < 0) {
 		note("kbdscroll: nowhere to inject touch events\n");
@@ -1016,10 +1193,11 @@ int main(int argc, char **argv)
 	if (wordd && wd_n && *o_text_focus)
 		keys_wfd = open(wordd->path, O_WRONLY);
 
-	note("kbdscroll: pad \"%s\" %dx%d -> screen \"%s\" %dx%d, scale %.2f/%.2f, slop %d\n",
+	note("kbdscroll: pad \"%s\" %dx%d -> screen \"%s\" %dx%d%s, scale %.2f/%.2f, slop %d\n",
 	     pad->name, pad_w, pad_h,
 	     uinput_scr_fd >= 0 ? "kbdscroll touch" : scr ? scr->name : "?",
-	     scr_w, scr_h, o_scale, o_scale_x, o_slop);
+	     scr_w, scr_h, scr_typea ? " (protocol A)" : scr_shared ? " (one slot)" : "",
+	     o_scale, o_scale_x, o_slop);
 	for (int i = 0; i < nkeyd; i++)
 		dbg("watching keys on %s (%s)\n", keyd[i]->path, keyd[i]->name);
 
@@ -1047,8 +1225,8 @@ int main(int argc, char **argv)
 	long long rel_last = 0;
 	int t_slot = -1, x0 = 0, y0 = 0;
 	int anchor_x = 0, anchor_y = 0, pad_anchor = 0, scroll_axis = 'y';
-	struct pollfd pf[1 + MAX_KEYDEVS];
-	int npf = 0;
+	struct pollfd pf[2 + MAX_KEYDEVS];
+	int npf = 0, scr_pf = -1;
 
 	for (int i = 0; i < SLOTS; i++) {
 		id[i] = -1; fresh[i] = 0;
@@ -1060,6 +1238,10 @@ int main(int argc, char **argv)
 		if (key_fd[i] >= 0) {
 			pf[npf].fd = key_fd[i]; pf[npf].events = POLLIN; pf[npf].revents = 0; npf++;
 		}
+	if (scr_rfd >= 0) {
+		scr_pf = npf;
+		pf[npf].fd = scr_rfd; pf[npf].events = POLLIN; pf[npf].revents = 0; npf++;
+	}
 
 	while (!quitting) {
 		/* A relative pad's stroke ends in silence, so while one is in flight
@@ -1073,10 +1255,24 @@ int main(int argc, char **argv)
 			note("kbdscroll: poll: %s\n", strerror(errno));
 			break;
 		}
+		/* ---- the screen: is a real finger down? ---- */
+		if (scr_pf >= 0 && (pf[scr_pf].revents & POLLIN)) {
+			struct input_event e;
+			while (read(scr_rfd, &e, sizeof e) == (ssize_t)sizeof e)
+				scr_event(&e);
+			if (real_down && (inj_down || (tracking && !rejected))) {
+				dbg("finger on the screen: %s\n", inj_down ?
+				    "it takes over the drag" : "gesture ignored");
+				inj_abandon();
+				scrolling = 0;
+				if (tracking)
+					rejected = 1;
+			}
+		}
 		/* ---- keyboards: modifier state, and "is someone typing" ---- */
 		for (int i = 1; i < npf; i++) {
 			struct input_event e;
-			if (!(pf[i].revents & POLLIN))
+			if (i == scr_pf || !(pf[i].revents & POLLIN))
 				continue;
 			while (read(pf[i].fd, &e, sizeof e) == (ssize_t)sizeof e) {
 				int is_mod = 0;
@@ -1274,6 +1470,7 @@ int main(int argc, char **argv)
 			continue;
 		}
 
+
 		/* finger lifted, or a second one arrived: the gesture is over */
 		if (active == 0 || id[t_slot] < 0 || active > 1) {
 			if (active > 1 && !rejected)
@@ -1310,18 +1507,30 @@ int main(int argc, char **argv)
 				rejected = 1;	/* one word per slide */
 				continue;
 			}
+			if (scr_shared && real_down) {
+				dbg("slide while a finger is on the screen: ignored\n");
+				rejected = 1;
+				continue;
+			}
 			dbg("slide %s\n", scroll_axis == 'x' ? (dx < 0 ? "left" : "right") :
 			    (dy < 0 ? "up" : "down"));
 			scrolling = 1;
 			/* A sideways drag starts on the side it moves away from, so
 			 * it has most of the screen to travel: a pager only changes
 			 * page on a slow drag once it has covered half the width. */
-			anchor_x = scroll_axis == 'x' ?
-				   (dx < 0 ? scr_w - scr_w / SIDE_DIV : scr_w / SIDE_DIV) : scr_w / 2;
-			anchor_y = scr_h / 2;
-			pad_anchor = scroll_axis == 'x' ? x[t_slot] : y[t_slot];
-			inj_touch(anchor_x, anchor_y);
-			continue;
+			/* Measured from where the finger came down, not from where
+			 * it crossed the slop, and moved there at once: a drag that
+			 * goes down and lifts a few pixels later is a tap to the
+			 * shell, in the middle of the screen. This one has already
+			 * travelled the slop, scaled, when it can first lift. */
+			if (scroll_axis == 'y') {
+				drag_y_start(y0);
+			} else {
+				anchor_x = dx < 0 ? scr_w - scr_w / SIDE_DIV : scr_w / SIDE_DIV;
+				anchor_y = scr_h / 2;
+				pad_anchor = x0;
+				inj_touch(anchor_x, anchor_y);
+			}
 		}
 
 		if (scroll_axis == 'x') {
@@ -1335,16 +1544,7 @@ int main(int argc, char **argv)
 			continue;
 		}
 
-		int ty = anchor_y + (int)((y[t_slot] - pad_anchor) * o_scale);
-		if (ty < scr_h / EDGE_DIV || ty > scr_h - scr_h / EDGE_DIV) {
-			/* ran out of screen: lift, and take hold again mid-screen */
-			inj_up();
-			anchor_y = scr_h / 2;
-			pad_anchor = y[t_slot];
-			inj_touch(scr_w / 2, anchor_y);
-			continue;
-		}
-		inj_touch(scr_w / 2, ty);
+		drag_y(y[t_slot]);
 		}
 		if (r < 0 && errno != EAGAIN && errno != EINTR) {
 			note("kbdscroll: %s: %s\n", pad->path, strerror(errno));
