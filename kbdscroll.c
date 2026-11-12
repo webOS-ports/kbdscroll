@@ -114,7 +114,7 @@ static char *o_text_focus = "";
 static char *o_backlight = "auto";
 static int o_pad_rotate, o_invert_x, o_invert_y;
 static double o_scale, o_scale_x, o_gain = 1.0, o_gain_x = 1.5;
-static int o_slop, o_typing_ms = 300, o_horizontal = 1;
+static int o_slop, o_typing_ms = 300, o_horizontal = 1, o_rest_ms = 400;
 static int o_step_x, o_step_y;
 static int o_rel_lift = 120, o_rel_w, o_rel_h;
 static int o_debug;
@@ -145,7 +145,8 @@ static const struct {
 { "gain",	    O_DBL, &o_gain,	   "multiplier behind an automatic scale" },
 { "gain-x",	    O_DBL, &o_gain_x,	   "multiplier behind an automatic scale-x" },
 { "slop",	    O_INT, &o_slop,	   "pad units before a touch counts as a slide (0: a tenth of the pad)" },
-{ "typing-ms",	    O_INT, &o_typing_ms,   "quiet time a key press needs before a touch may scroll" },
+{ "typing-ms",	    O_INT, &o_typing_ms,   "quiet time after a key press or release before a touch may scroll" },
+{ "rest-ms",	    O_INT, &o_rest_ms,	   "a contact still for this long is resting, not sliding (0: off)" },
 { "horizontal",	    O_INT, &o_horizontal,  "0 to ignore sideways slides" },
 { "cursor-step-x",  O_INT, &o_step_x,	   "pad units per Left/Right key (0: derived from the pad)" },
 { "cursor-step-y",  O_INT, &o_step_y,	   "pad units per Up/Down key (0: derived from the pad)" },
@@ -793,26 +794,66 @@ static void scr_event(const struct input_event *e)
  * There is no ABS_MT_TRACKING_ID of -1, the only lift the slot path below
  * knows, so read as slots the first contact never came up: every later touch
  * was measured from the first one's position and locked to its axis, and a
- * key pressed during it rejected every slide after. Here the n-th contact of a
- * frame fills slot n, and a slot no contact filled is up when the frame ends.
- * The tracking id, where the device sends one, only tells a new contact in the
- * same place in the list from the one before; mtk-pad sends 0 for every
- * contact. Called for every event from such a surface; the caller acts on the
- * slots at SYN_REPORT as for any other surface. */
-static int pa_n, pa_pos, pa_tid = -1, pa_seen[SLOTS];
+ * key pressed during it rejected every slide after. Here a frame's contacts are
+ * collected and put in slots when the frame ends, and a slot no contact filled
+ * is up. A contact goes back to the slot its tracking id held in the frame
+ * before, so another contact lifting does not move it: on the Titan a thumb
+ * resting on the keys is listed after the sliding finger, and taking the
+ * finger's place in the list made it a new touch, its own start point and age
+ * lost. A contact with no slot of its own (a new id, or no id: mtk-pad sends 0
+ * for a lone contact) takes the first slot nobody claimed, and is a new touch
+ * unless that slot held its id. Called for every event from such a surface;
+ * the caller acts on the slots at SYN_REPORT as for any other surface. */
+static int pa_n, pa_pos, pa_tid = -1;
+#define PA_NONE INT_MIN	/* an axis the contact did not send */
+static int pa_cid[SLOTS];
+static int pa_cx[SLOTS] = { [0 ... SLOTS - 1] = PA_NONE };
+static int pa_cy[SLOTS] = { [0 ... SLOTS - 1] = PA_NONE };
 
-static void pad_typea_contact(int *id, int *fresh)
+static void pad_typea_contact(void)
 {
 	if (pa_pos && pa_n < SLOTS) {
-		int t = pa_tid >= 0 ? pa_tid : 0;
-		if (id[pa_n] != t)
-			fresh[pa_n] = 1;	/* was up, or another contact */
-		id[pa_n] = t;
-		pa_seen[pa_n] = 1;
+		pa_cid[pa_n] = pa_tid >= 0 ? pa_tid : 0;
 		pa_n++;
 	}
 	pa_pos = 0;
 	pa_tid = -1;
+}
+
+static void pad_typea_frame(int *id, int *rx, int *ry, int *fresh)
+{
+	int taken[SLOTS] = { 0 }, at[SLOTS];
+
+	/* Each contact back to the slot that held its id. */
+	for (int c = 0; c < pa_n; c++) {
+		at[c] = -1;
+		for (int i = 0; i < SLOTS; i++)
+			if (!taken[i] && id[i] == pa_cid[c]) {
+				at[c] = i;
+				taken[i] = 1;
+				break;
+			}
+	}
+	/* The rest to the first slot nobody claimed. */
+	for (int c = 0; c < pa_n; c++) {
+		for (int i = 0; at[c] < 0 && i < SLOTS; i++)
+			if (!taken[i]) {
+				at[c] = i;
+				taken[i] = 1;
+			}
+		int i = at[c];
+		if (id[i] != pa_cid[c])
+			fresh[i] = 1;	/* was up, or another contact */
+		id[i] = pa_cid[c];
+		/* An axis the frame left out keeps its value. */
+		if (pa_cx[c] != PA_NONE) rx[i] = pa_cx[c];
+		if (pa_cy[c] != PA_NONE) ry[i] = pa_cy[c];
+		pa_cx[c] = pa_cy[c] = PA_NONE;
+	}
+	for (int i = 0; i < SLOTS; i++)
+		if (!taken[i])
+			id[i] = -1;
+	pa_n = 0;
 }
 
 static void pad_typea_event(const struct input_event *e, int *id, int *rx,
@@ -826,28 +867,94 @@ static void pad_typea_event(const struct input_event *e, int *id, int *rx,
 			pa_tid = e->value;
 			break;
 		case ABS_MT_POSITION_X:
-			rx[pa_n] = e->value - min_x;
+			pa_cx[pa_n] = e->value - min_x;
 			pa_pos = 1;
 			break;
 		case ABS_MT_POSITION_Y:
-			ry[pa_n] = e->value - min_y;
+			pa_cy[pa_n] = e->value - min_y;
 			pa_pos = 1;
 			break;
 		default:
 			break;		/* touch size and the like */
 		}
 	} else if (e->type == EV_SYN && e->code == SYN_MT_REPORT) {
-		pad_typea_contact(id, fresh);
+		pad_typea_contact();
 	} else if (e->type == EV_SYN && e->code == SYN_REPORT) {
 		/* A contact whose SYN_MT_REPORT went missing still counts. */
-		pad_typea_contact(id, fresh);
-		for (int i = 0; i < SLOTS; i++) {
-			if (!pa_seen[i])
-				id[i] = -1;
-			pa_seen[i] = 0;
-		}
-		pa_n = 0;
+		pad_typea_contact();
+		pad_typea_frame(id, rx, ry, fresh);
 	}
+}
+
+/* Whether a key other than the cursor modifier is down on a keyboard, read
+ * from the kernel's own key state rather than counted from events, so a
+ * release that went missing cannot leave the surface ignored. */
+static int key_held(int fd, const int *mods, int nmods)
+{
+	unsigned char bits[KEY_MAX / 8 + 1];
+
+	memset(bits, 0, sizeof bits);
+	if (ioctl(fd, EVIOCGKEY(sizeof bits), bits) < 0)
+		return 0;
+	for (int m = 0; m < nmods; m++)
+		if (mods[m] >= 0 && mods[m] <= KEY_MAX)
+			bits[mods[m] / 8] &= (unsigned char)~(1u << (mods[m] % 8));
+	for (size_t i = 0; i < sizeof bits; i++)
+		if (bits[i])
+			return 1;
+	return 0;
+}
+
+/* A contact resting on the surface - the thumb that holds the phone, a
+ * finger lying on the keys - is not a slide, and must neither start one nor
+ * cancel one as a second finger. On the Titan a thumb rests on the top row
+ * for seconds while the other one slides, and every time the sliding thumb
+ * lands or lifts the pad moves the resting one by 100 to 300 units at once
+ * (recorded on the device, 12 Nov 2026): read as a slide, that dragged the
+ * page sideways, and the next landing cancelled it again. So a contact rests
+ *  - when another one lands or lifts and it is not the one driving a slide,
+ *  - or when it has not moved a slop o_rest_ms after it landed (a sliding
+ *    finger there had moved a slop within 210 ms),
+ *  - or while a key is held (keys_down): on the Titan, holding a key - most
+ *    often backspace, to delete a run - makes the pad report phantom
+ *    contacts all over the surface, 20 to 34 a second, each 10 to 80 ms long
+ *    and jumping by up to 600 units, and none once the key is let go,
+ * and it rests until it lifts, whatever it does in between. landed[] marks
+ * the slots that took a new contact in this frame; was[] (whether a slot was
+ * down in the frame before), far[] and rest[] are kept here, per slot. driver
+ * is the slot driving a slide, or -1. Returns how many contacts are not
+ * resting, and the first of them in *first (-1: none). */
+static int live_contacts(const int *id, const int *landed, int *was,
+			 const int *x, const int *y, const int *sx, const int *sy,
+			 const long long *down_at, int *far, int *rest,
+			 int driver, int keys_down, long long now, int *first)
+{
+	int n = 0, change = 0;
+
+	for (int i = 0; i < SLOTS; i++) {
+		if (landed[i])
+			far[i] = rest[i] = 0;	/* a new contact */
+		if ((id[i] >= 0 && landed[i]) || (was[i] && (id[i] < 0 || landed[i])))
+			change = 1;
+	}
+	*first = -1;
+	for (int i = 0; i < SLOTS; i++) {
+		was[i] = id[i] >= 0;
+		if (id[i] < 0)
+			continue;
+		if ((change && !landed[i] && i != driver) || keys_down)
+			rest[i] = 1;
+		if (abs(x[i] - sx[i]) >= o_slop || abs(y[i] - sy[i]) >= o_slop)
+			far[i] = 1;
+		if (!far[i] && o_rest_ms > 0 && now - down_at[i] >= o_rest_ms)
+			rest[i] = 1;
+		if (rest[i])
+			continue;
+		n++;
+		if (*first < 0)
+			*first = i;
+	}
+	return n;
 }
 
 static void tap_key(int fd, int code)
@@ -1278,10 +1385,12 @@ int main(int argc, char **argv)
 	sigaction(SIGHUP, &sa, NULL);
 
 	/* --------------------------------------------------------- the loop */
-	int alt_down = 0, was_alt = 0, alt_block = 0;
+	int alt_down = 0, was_alt = 0;
 	int drv = -1, axis = 0, ax = 0, ay = 0;		/* cursor-mode driver contact */
 	int id[SLOTS], rx[SLOTS], ry[SLOTS], x[SLOTS], y[SLOTS];
 	int sx[SLOTS], sy[SLOTS], fresh[SLOTS];
+	int far[SLOTS], rest[SLOTS], landed[SLOTS], was[SLOTS];	/* see live_contacts() */
+	long long down_at[SLOTS], t_down = 0;
 	int slot = 0;
 	long long last_key = 0;
 	int tracking = 0, rejected = 0, scrolling = 0;
@@ -1294,9 +1403,11 @@ int main(int argc, char **argv)
 	int anchor_x = 0, anchor_y = 0, pad_anchor = 0, scroll_axis = 'y';
 	struct pollfd pf[2 + MAX_KEYDEVS];
 	int npf = 0, scr_pf = -1;
+	int held[2 + MAX_KEYDEVS] = { 0 }, keys_down = 0;	/* per pf[] entry */
 
 	for (int i = 0; i < SLOTS; i++) {
 		id[i] = -1; fresh[i] = 0;
+		far[i] = rest[i] = landed[i] = was[i] = 0; down_at[i] = 0;
 		rx[i] = ry[i] = x[i] = y[i] = sx[i] = sy[i] = 0;
 	}
 
@@ -1359,9 +1470,16 @@ int main(int argc, char **argv)
 					last_key = now_ms();
 					if (tracking && !scrolling)
 						rejected = 1;	/* typing, not a slide */
+				} else if (e.value == 0) {
+					last_key = now_ms();	/* quiet from the release */
 				}
 			}
+			held[i] = key_held(pf[i].fd, cursor_mod, ncursor_mod);
 		}
+		keys_down = 0;
+		for (int i = 1; i < npf; i++)
+			if (i != scr_pf && held[i])
+				keys_down = 1;
 		/* The relative pad's lift. Feeding one synthetic SYN_REPORT through
 		 * the loop below - rather than duplicating the end-of-stroke handling
 		 * - is what keeps the two input shapes on exactly one code path. */
@@ -1456,13 +1574,16 @@ int main(int argc, char **argv)
 		if (e.type != EV_SYN || e.code != SYN_REPORT)
 			continue;
 
-		int active = 0, first = -1;
+		int active = 0;
 		for (int i = 0; i < SLOTS; i++) {
+			landed[i] = 0;
 			if (id[i] < 0) continue;
 			pad_xform(rx[i], ry[i], &x[i], &y[i]);
-			if (fresh[i]) { sx[i] = x[i]; sy[i] = y[i]; fresh[i] = 0; }
+			if (fresh[i]) {
+				sx[i] = x[i]; sy[i] = y[i]; fresh[i] = 0;
+				down_at[i] = now_ms(); landed[i] = 1;
+			}
 			active++;
-			if (first < 0) first = i;
 		}
 
 		/* ---- the cursor modifier is held: arrow keys ---- */
@@ -1517,22 +1638,25 @@ int main(int argc, char **argv)
 			 * cursor; none of them may turn into a scroll. */
 			was_alt = 0;
 			drv = -1;
-			alt_block = active > 0;
+			for (int i = 0; i < SLOTS; i++)
+				if (id[i] >= 0)
+					rest[i] = 1;
 			dbg("modifier up\n");
 		}
-		if (alt_block) {
-			if (active == 0) alt_block = 0;
-			continue;
-		}
+		int lfirst, live = live_contacts(id, landed, was, x, y, sx, sy,
+						 down_at, far, rest,
+						 tracking && scrolling ? t_slot : -1,
+						 keys_down, now_ms(), &lfirst);
 
 		/* ---- scrolling ---- */
 		if (!tracking) {
-			if (active == 1) {
+			if (live == 1) {
 				tracking = 1;
 				scrolling = 0;
-				t_slot = first;
-				x0 = x[first];
-				y0 = y[first];
+				t_slot = lfirst;
+				t_down = down_at[lfirst];
+				x0 = x[lfirst];
+				y0 = y[lfirst];
 				rejected = (now_ms() - last_key < o_typing_ms) || !display_on();
 				dbg("touch at %d,%d%s\n", x0, y0, !rejected ? "" :
 				    now_ms() - last_key < o_typing_ms ?
@@ -1542,17 +1666,24 @@ int main(int argc, char **argv)
 		}
 
 
-		/* finger lifted, or a second one arrived: the gesture is over */
-		if (active == 0 || id[t_slot] < 0 || active > 1) {
-			if (active > 1 && !rejected)
+		/* Finger lifted, a second one arrived, or it turned out to be
+		 * resting: the gesture is over. A contact resting elsewhere on
+		 * the surface does not count either way. */
+		if (id[t_slot] < 0 || down_at[t_slot] != t_down || rest[t_slot] ||
+		    live != 1) {
+			if (live > 1 && !rejected)
 				dbg("second contact: gesture cancelled\n");
-			else if (active == 0)
+			else if (keys_down && id[t_slot] >= 0 && down_at[t_slot] == t_down)
+				dbg("a key is held: gesture cancelled\n");
+			else if (rest[t_slot] && id[t_slot] >= 0 && down_at[t_slot] == t_down)
+				dbg("still for %d ms: resting, not a slide\n", o_rest_ms);
+			else
 				dbg("lifted%s\n", scrolling ? "" : rejected ?
 				    " (was ignored)" : " before moving past the slop");
 			inj_up();
 			tracking = scrolling = 0;
-			if (active > 1) rejected = 1;
-			if (active == 0) rejected = 0;
+			if (live > 1) rejected = 1;
+			if (live == 0) rejected = 0;
 			continue;
 		}
 		if (rejected)
