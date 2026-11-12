@@ -786,6 +786,69 @@ static void scr_event(const struct input_event *e)
 	}
 }
 
+/* A protocol A surface: multitouch axes but no slots, like the Titan's mtk-pad.
+ * Each frame lists the contacts that are down, each closed by SYN_MT_REPORT,
+ * and a lift is a frame with none in it (BTN_TOUCH 0 and a bare SYN_MT_REPORT).
+ * There is no ABS_MT_TRACKING_ID of -1, the only lift the slot path below
+ * knows, so read as slots the first contact never came up: every later touch
+ * was measured from the first one's position and locked to its axis, and a
+ * key pressed during it rejected every slide after. Here the n-th contact of a
+ * frame fills slot n, and a slot no contact filled is up when the frame ends.
+ * The tracking id, where the device sends one, only tells a new contact in the
+ * same place in the list from the one before; mtk-pad sends 0 for every
+ * contact. Called for every event from such a surface; the caller acts on the
+ * slots at SYN_REPORT as for any other surface. */
+static int pa_n, pa_pos, pa_tid = -1, pa_seen[SLOTS];
+
+static void pad_typea_contact(int *id, int *fresh)
+{
+	if (pa_pos && pa_n < SLOTS) {
+		int t = pa_tid >= 0 ? pa_tid : 0;
+		if (id[pa_n] != t)
+			fresh[pa_n] = 1;	/* was up, or another contact */
+		id[pa_n] = t;
+		pa_seen[pa_n] = 1;
+		pa_n++;
+	}
+	pa_pos = 0;
+	pa_tid = -1;
+}
+
+static void pad_typea_event(const struct input_event *e, int *id, int *rx,
+			    int *ry, int *fresh, int min_x, int min_y)
+{
+	if (e->type == EV_ABS) {
+		if (pa_n >= SLOTS)
+			return;		/* more contacts than we track */
+		switch (e->code) {
+		case ABS_MT_TRACKING_ID:
+			pa_tid = e->value;
+			break;
+		case ABS_MT_POSITION_X:
+			rx[pa_n] = e->value - min_x;
+			pa_pos = 1;
+			break;
+		case ABS_MT_POSITION_Y:
+			ry[pa_n] = e->value - min_y;
+			pa_pos = 1;
+			break;
+		default:
+			break;		/* touch size and the like */
+		}
+	} else if (e->type == EV_SYN && e->code == SYN_MT_REPORT) {
+		pad_typea_contact(id, fresh);
+	} else if (e->type == EV_SYN && e->code == SYN_REPORT) {
+		/* A contact whose SYN_MT_REPORT went missing still counts. */
+		pad_typea_contact(id, fresh);
+		for (int i = 0; i < SLOTS; i++) {
+			if (!pa_seen[i])
+				id[i] = -1;
+			pa_seen[i] = 0;
+		}
+		pa_n = 0;
+	}
+}
+
 static void tap_key(int fd, int code)
 {
 	emit(fd, EV_KEY, code, 1);
@@ -1193,8 +1256,11 @@ int main(int argc, char **argv)
 	if (wordd && wd_n && *o_text_focus)
 		keys_wfd = open(wordd->path, O_WRONLY);
 
-	note("kbdscroll: pad \"%s\" %dx%d -> screen \"%s\" %dx%d%s, scale %.2f/%.2f, slop %d\n",
-	     pad->name, pad_w, pad_h,
+	/* A multitouch surface with no slots speaks protocol A. */
+	const int pad_typea = pad->mt && pad->slots < 0;
+
+	note("kbdscroll: pad \"%s\" %dx%d%s -> screen \"%s\" %dx%d%s, scale %.2f/%.2f, slop %d\n",
+	     pad->name, pad_w, pad_h, pad_typea ? " (protocol A)" : "",
 	     uinput_scr_fd >= 0 ? "kbdscroll touch" : scr ? scr->name : "?",
 	     scr_w, scr_h, scr_typea ? " (protocol A)" : scr_shared ? " (one slot)" : "",
 	     o_scale, o_scale_x, o_slop);
@@ -1321,7 +1387,11 @@ int main(int argc, char **argv)
 			} else if ((r = read(pad_fd, &e, sizeof e)) != (ssize_t)sizeof e) {
 				break;
 			}
-		if (e.type == EV_ABS) {
+		if (pad_typea) {
+			pad_typea_event(&e, id, rx, ry, fresh, pad->min_x, pad->min_y);
+			if (e.type != EV_SYN || e.code != SYN_REPORT)
+				continue;
+		} else if (e.type == EV_ABS) {
 			switch (e.code) {
 			case ABS_MT_SLOT:
 				if (e.value >= 0 && e.value < SLOTS)

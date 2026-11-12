@@ -346,8 +346,169 @@ static void test_scr_event_one_slot(void)
 	feed(EV_ABS, ABS_MT_SLOT, 0);
 }
 
+/* ---- a protocol A surface (the Titan's mtk-pad) ---- */
+
+static int pid[SLOTS], prx[SLOTS], pry[SLOTS], pfresh[SLOTS];
+
+static void pad_reset(void)
+{
+	for (int i = 0; i < SLOTS; i++) {
+		pid[i] = -1; prx[i] = pry[i] = 0; pfresh[i] = 0; pa_seen[i] = 0;
+	}
+	pa_n = pa_pos = 0;
+	pa_tid = -1;
+}
+
+static void pfeed(int type, int code, int value)
+{
+	struct input_event e;
+	memset(&e, 0, sizeof e);
+	e.type = type; e.code = code; e.value = value;
+	pad_typea_event(&e, pid, prx, pry, pfresh, 0, 0);
+}
+
+/* One contact as mtk-pad reports it, captured on the Titan (12 Nov 2026). */
+static void mtk_contact(int tid, int x, int y)
+{
+	pfeed(EV_ABS, ABS_MT_TRACKING_ID, tid);
+	pfeed(EV_ABS, ABS_MT_POSITION_X, x);
+	pfeed(EV_ABS, ABS_MT_POSITION_Y, y);
+	pfeed(EV_ABS, ABS_MT_TOUCH_MAJOR, 6);
+	pfeed(EV_ABS, ABS_MT_TOUCH_MINOR, 5);
+	pfeed(EV_SYN, SYN_MT_REPORT, 0);
+}
+
+static void mtk_frame(int x, int y)
+{
+	mtk_contact(0, x, y);
+	pfeed(EV_SYN, SYN_REPORT, 0);
+}
+
+static void mtk_lift(void)
+{
+	pfeed(EV_KEY, BTN_TOUCH, 0);
+	pfeed(EV_SYN, SYN_MT_REPORT, 0);
+	pfeed(EV_SYN, SYN_REPORT, 0);
+}
+
+/* What the main loop does with a fresh contact at SYN_REPORT. */
+static void consume_fresh(void)
+{
+	for (int i = 0; i < SLOTS; i++)
+		pfresh[i] = 0;
+}
+
+/* The bug: mtk-pad never sends a tracking id of -1, so the first contact
+ * never came up and the next touch was not fresh. */
+static void test_pad_typea_lift(void)
+{
+	pad_reset();
+	pfeed(EV_ABS, ABS_MT_TRACKING_ID, 0);
+	pfeed(EV_KEY, BTN_TOUCH, 1);
+	pfeed(EV_ABS, ABS_MT_POSITION_X, 322);
+	pfeed(EV_ABS, ABS_MT_POSITION_Y, 261);
+	pfeed(EV_SYN, SYN_MT_REPORT, 0);
+	pfeed(EV_SYN, SYN_REPORT, 0);
+	CHECK(pid[0] == 0);
+	CHECK(pfresh[0] == 1);
+	CHECK(prx[0] == 322 && pry[0] == 261);
+	CHECK(pid[1] == -1);
+	consume_fresh();
+
+	mtk_frame(349, 265);
+	CHECK(pid[0] == 0);
+	CHECK(pfresh[0] == 0);			/* the same contact moving */
+	CHECK(prx[0] == 349 && pry[0] == 265);
+
+	mtk_lift();
+	CHECK(pid[0] == -1);
+
+	mtk_frame(790, 347);			/* tracking id 0 again */
+	CHECK(pid[0] == 0);
+	CHECK(pfresh[0] == 1);			/* a new touch, where it lands */
+	CHECK(prx[0] == 790 && pry[0] == 347);
+}
+
+static void test_pad_typea_two_contacts(void)
+{
+	pad_reset();
+	mtk_contact(0, 100, 200);
+	mtk_contact(1, 900, 400);
+	pfeed(EV_SYN, SYN_REPORT, 0);
+	CHECK(pid[0] == 0 && pid[1] == 1);
+	CHECK(prx[0] == 100 && prx[1] == 900);
+	CHECK(pry[0] == 200 && pry[1] == 400);
+	CHECK(pid[2] == -1);
+	consume_fresh();
+
+	mtk_frame(110, 210);			/* the second one lifted */
+	CHECK(pid[0] == 0 && pfresh[0] == 0);
+	CHECK(pid[1] == -1);
+}
+
+/* Another contact in the same place in the list, without a frame between. */
+static void test_pad_typea_new_id(void)
+{
+	pad_reset();
+	mtk_frame(100, 200);
+	consume_fresh();
+	mtk_contact(5, 600, 300);
+	pfeed(EV_SYN, SYN_REPORT, 0);
+	CHECK(pid[0] == 5);
+	CHECK(pfresh[0] == 1);
+}
+
+/* No tracking ids at all, and a contact the frame closed without its
+ * SYN_MT_REPORT: still a contact. An empty frame is still a lift. */
+static void test_pad_typea_sparse(void)
+{
+	pad_reset();
+	pfeed(EV_ABS, ABS_MT_POSITION_X, 40);
+	pfeed(EV_ABS, ABS_MT_POSITION_Y, 50);
+	pfeed(EV_SYN, SYN_REPORT, 0);
+	CHECK(pid[0] == 0 && pfresh[0] == 1);
+	CHECK(prx[0] == 40 && pry[0] == 50);
+	pfeed(EV_SYN, SYN_REPORT, 0);
+	CHECK(pid[0] == -1);
+}
+
+/* Positions are relative to the axis minimum, as for the other surfaces. */
+static void test_pad_typea_min(void)
+{
+	struct input_event e;
+	pad_reset();
+	memset(&e, 0, sizeof e);
+	e.type = EV_ABS; e.code = ABS_MT_POSITION_X; e.value = 150;
+	pad_typea_event(&e, pid, prx, pry, pfresh, 100, 20);
+	e.code = ABS_MT_POSITION_Y; e.value = 70;
+	pad_typea_event(&e, pid, prx, pry, pfresh, 100, 20);
+	e.type = EV_SYN; e.code = SYN_REPORT; e.value = 0;
+	pad_typea_event(&e, pid, prx, pry, pfresh, 100, 20);
+	CHECK(prx[0] == 50 && pry[0] == 50);
+}
+
+/* More contacts than slots: the extra ones are dropped, nothing overruns. */
+static void test_pad_typea_overflow(void)
+{
+	pad_reset();
+	for (int i = 0; i < SLOTS + 3; i++)
+		mtk_contact(i, 10 * i, 5 * i);
+	pfeed(EV_SYN, SYN_REPORT, 0);
+	for (int i = 0; i < SLOTS; i++)
+		CHECK(pid[i] == i && prx[i] == 10 * i);
+	mtk_lift();
+	for (int i = 0; i < SLOTS; i++)
+		CHECK(pid[i] == -1);
+}
+
 int main(void)
 {
+	test_pad_typea_lift();
+	test_pad_typea_two_contacts();
+	test_pad_typea_new_id();
+	test_pad_typea_sparse();
+	test_pad_typea_min();
+	test_pad_typea_overflow();
 	test_typea_down_frame();
 	test_typea_move_frame();
 	test_typea_lift_frame();
