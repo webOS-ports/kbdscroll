@@ -353,7 +353,8 @@ static int pid[SLOTS], prx[SLOTS], pry[SLOTS], pfresh[SLOTS];
 static void pad_reset(void)
 {
 	for (int i = 0; i < SLOTS; i++) {
-		pid[i] = -1; prx[i] = pry[i] = 0; pfresh[i] = 0; pa_seen[i] = 0;
+		pid[i] = -1; prx[i] = pry[i] = 0; pfresh[i] = 0;
+		pa_cx[i] = pa_cy[i] = PA_NONE;
 	}
 	pa_n = pa_pos = 0;
 	pa_tid = -1;
@@ -501,6 +502,297 @@ static void test_pad_typea_overflow(void)
 		CHECK(pid[i] == -1);
 }
 
+/* A contact keeps its slot when one listed before it lifts: the Titan lists
+ * the sliding finger first and a resting thumb after it. */
+static void test_pad_typea_keeps_slot(void)
+{
+	pad_reset();
+	mtk_contact(0, 400, 500);
+	mtk_contact(1, 1294, 189);
+	pfeed(EV_SYN, SYN_REPORT, 0);
+	consume_fresh();
+
+	mtk_contact(1, 1163, 217);		/* the finger lifted */
+	pfeed(EV_SYN, SYN_REPORT, 0);
+	CHECK(pid[0] == -1);
+	CHECK(pid[1] == 1 && pfresh[1] == 0);	/* still the same contact */
+	CHECK(prx[1] == 1163 && pry[1] == 217);
+
+	mtk_contact(0, 717, 347);		/* the finger again, listed first */
+	mtk_contact(1, 1313, 218);
+	pfeed(EV_SYN, SYN_REPORT, 0);
+	CHECK(pid[0] == 0 && pfresh[0] == 1);
+	CHECK(prx[0] == 717 && pry[0] == 347);
+	CHECK(pid[1] == 1 && pfresh[1] == 0);
+	CHECK(prx[1] == 1313);
+}
+
+/* Two contacts swapping places in the list stay in their slots. */
+static void test_pad_typea_reordered(void)
+{
+	pad_reset();
+	mtk_contact(3, 10, 20);
+	mtk_contact(4, 30, 40);
+	pfeed(EV_SYN, SYN_REPORT, 0);
+	consume_fresh();
+	mtk_contact(4, 31, 41);
+	mtk_contact(3, 11, 21);
+	pfeed(EV_SYN, SYN_REPORT, 0);
+	CHECK(pid[0] == 3 && prx[0] == 11 && pfresh[0] == 0);
+	CHECK(pid[1] == 4 && prx[1] == 31 && pfresh[1] == 0);
+}
+
+/* An axis a contact leaves out of a frame keeps its value. */
+static void test_pad_typea_missing_axis(void)
+{
+	pad_reset();
+	mtk_frame(100, 200);
+	consume_fresh();
+	pfeed(EV_ABS, ABS_MT_TRACKING_ID, 0);
+	pfeed(EV_ABS, ABS_MT_POSITION_X, 150);
+	pfeed(EV_SYN, SYN_MT_REPORT, 0);
+	pfeed(EV_SYN, SYN_REPORT, 0);
+	CHECK(pid[0] == 0 && pfresh[0] == 0);
+	CHECK(prx[0] == 150 && pry[0] == 200);
+	pfeed(EV_ABS, ABS_MT_TRACKING_ID, 0);
+	pfeed(EV_ABS, ABS_MT_POSITION_Y, 260);
+	pfeed(EV_SYN, SYN_MT_REPORT, 0);
+	pfeed(EV_SYN, SYN_REPORT, 0);
+	CHECK(prx[0] == 150 && pry[0] == 260);
+}
+
+/* ... also when it is listed in another place: what the contact before it
+ * in the list sent last frame is not its value. */
+static void test_pad_typea_missing_axis_reordered(void)
+{
+	pad_reset();
+	mtk_contact(3, 10, 20);
+	mtk_contact(4, 30, 40);
+	pfeed(EV_SYN, SYN_REPORT, 0);
+	consume_fresh();
+	pfeed(EV_ABS, ABS_MT_TRACKING_ID, 4);
+	pfeed(EV_ABS, ABS_MT_POSITION_X, 35);
+	pfeed(EV_SYN, SYN_MT_REPORT, 0);
+	pfeed(EV_SYN, SYN_REPORT, 0);
+	CHECK(pid[1] == 4 && prx[1] == 35 && pry[1] == 40);
+}
+
+/* ---- resting contacts ---- */
+
+static int lid[SLOTS], llanded[SLOTS], lwas[SLOTS], lx[SLOTS], ly[SLOTS];
+static int lsx[SLOTS], lsy[SLOTS], lfar[SLOTS], lrest[SLOTS];
+static long long ldown[SLOTS];
+
+static void live_reset(void)
+{
+	o_slop = 72;
+	o_rest_ms = 400;
+	for (int i = 0; i < SLOTS; i++) {
+		lid[i] = -1;
+		llanded[i] = lwas[i] = lfar[i] = lrest[i] = 0;
+		lx[i] = ly[i] = lsx[i] = lsy[i] = 0;
+		ldown[i] = 0;
+	}
+}
+
+/* One frame: slot i down at (x, y), landing now if it was up. */
+static void ldown_at(int i, int x, int y, long long now)
+{
+	if (lid[i] < 0) {
+		lid[i] = i;
+		llanded[i] = 1;
+		lsx[i] = x; lsy[i] = y;
+		ldown[i] = now;
+	}
+	lx[i] = x; ly[i] = y;
+}
+
+static int lframe(int driver, long long now, int *first)
+{
+	int n = live_contacts(lid, llanded, lwas, lx, ly, lsx, lsy, ldown,
+			      lfar, lrest, driver, now, first);
+	for (int i = 0; i < SLOTS; i++)
+		llanded[i] = 0;
+	return n;
+}
+
+/* A thumb resting when a finger lands rests; the finger is the live one. */
+static void test_rest_when_another_lands(void)
+{
+	int first;
+	live_reset();
+	ldown_at(1, 1294, 189, 0);
+	CHECK(lframe(-1, 0, &first) == 1 && first == 1);
+	ldown_at(1, 1294, 189, 100);
+	ldown_at(0, 700, 400, 100);
+	CHECK(lframe(-1, 100, &first) == 1 && first == 0);
+	CHECK(lrest[1] == 1);
+	/* and it stays resting, wherever it is moved to */
+	ldown_at(0, 600, 400, 110);
+	ldown_at(1, 1100, 240, 110);
+	CHECK(lframe(0, 110, &first) == 1 && first == 0);
+}
+
+/* The contact driving a slide is not made to rest by a landing: the new
+ * one is a second finger, and two live contacts cancel the gesture. */
+static void test_driver_does_not_rest(void)
+{
+	int first;
+	live_reset();
+	ldown_at(0, 700, 400, 0);
+	lframe(-1, 0, &first);
+	ldown_at(0, 600, 400, 30);
+	lframe(-1, 30, &first);
+	ldown_at(0, 550, 400, 40);
+	ldown_at(1, 200, 300, 40);
+	CHECK(lframe(0, 40, &first) == 2 && first == 0);
+	CHECK(lrest[0] == 0 && lrest[1] == 0);
+}
+
+/* What stays when a contact lifts rests: the thumb, once the finger is up. */
+static void test_rest_when_another_lifts(void)
+{
+	int first;
+	live_reset();
+	ldown_at(0, 700, 400, 0);
+	ldown_at(1, 1294, 189, 0);
+	CHECK(lframe(-1, 0, &first) == 2);	/* landed together: both live */
+	lid[0] = -1;
+	ldown_at(1, 1163, 217, 50);
+	CHECK(lframe(-1, 50, &first) == 0 && first == -1);
+	CHECK(lrest[1] == 1);
+}
+
+/* Still for o_rest_ms after landing: resting. Moved a slop before then:
+ * not, however long it is down. 0 turns the time rule off. */
+static void test_rest_by_time(void)
+{
+	int first;
+	live_reset();
+	ldown_at(0, 500, 500, 0);
+	lframe(-1, 0, &first);
+	ldown_at(0, 530, 500, 399);
+	CHECK(lframe(-1, 399, &first) == 1);
+	ldown_at(0, 530, 500, 400);
+	CHECK(lframe(-1, 400, &first) == 0);
+	ldown_at(0, 900, 500, 450);		/* moving now does not undo it */
+	CHECK(lframe(-1, 450, &first) == 0);
+
+	live_reset();
+	ldown_at(0, 500, 500, 0);
+	lframe(-1, 0, &first);
+	ldown_at(0, 572, 500, 100);		/* exactly a slop */
+	lframe(-1, 100, &first);
+	ldown_at(0, 572, 500, 5000);
+	CHECK(lframe(-1, 5000, &first) == 1 && first == 0);
+
+	live_reset();
+	o_rest_ms = 0;
+	ldown_at(0, 500, 500, 0);
+	lframe(-1, 0, &first);
+	ldown_at(0, 500, 500, 100000);
+	CHECK(lframe(-1, 100000, &first) == 1);
+}
+
+/* A resting slot that lifts and takes a new contact is live again. */
+static void test_rest_cleared_by_landing(void)
+{
+	int first;
+	live_reset();
+	ldown_at(0, 500, 500, 0);
+	lframe(-1, 0, &first);
+	ldown_at(0, 500, 500, 500);
+	CHECK(lframe(-1, 500, &first) == 0);
+	lid[0] = -1;
+	CHECK(lframe(-1, 510, &first) == 0);
+	ldown_at(0, 300, 300, 520);
+	CHECK(lframe(-1, 520, &first) == 1 && first == 0);
+	CHECK(lrest[0] == 0);
+}
+
+/* Recorded on the Titan (12 Nov 2026), 0.72 s to 1.30 s of a capture: a
+ * finger (id 0) slides while a thumb (id 1) rests on the top row; the finger
+ * lifts, and on its own the thumb is reported moving by up to 280 units;
+ * then the finger lands again. Before, the thumb took the finger's slot,
+ * counted as a new touch and its jump as a slide. */
+static const struct { int ms, n; struct { int id, x, y; } c[2]; } rec[] = {
+	{  721, 2, { { 0, 225, 519 }, { 1, 1294, 189 } } },
+	{  759, 2, { { 0, 234, 489 }, { 1, 1294, 189 } } },
+	{  778, 2, { { 0, 267, 461 }, { 1, 1294, 189 } } },
+	{  797, 2, { { 0, 311, 431 }, { 1, 1294, 189 } } },
+	{  807, 2, { { 0, 337, 416 }, { 1, 1294, 189 } } },
+	{  817, 2, { { 0, 382, 401 }, { 1, 1294, 189 } } },
+	{  826, 2, { { 0, 427, 393 }, { 1, 1294, 189 } } },
+	{  836, 2, { { 0, 476, 385 }, { 1, 1294, 189 } } },
+	{  846, 2, { { 0, 534, 376 }, { 1, 1294, 189 } } },
+	{  855, 2, { { 0, 603, 369 }, { 1, 1294, 189 } } },
+	{  874, 1, { { 1, 1294, 189 } } },
+	{  884, 1, { { 1, 1163, 217 } } },
+	{  893, 1, { { 1, 1138, 222 } } },
+	{  941, 1, { { 1, 1165, 227 } } },
+	{  951, 1, { { 1, 1215, 226 } } },
+	{  960, 1, { { 1, 1280, 223 } } },
+	{  970, 1, { { 1, 1326, 221 } } },
+	{  990, 1, { { 1, 1365, 217 } } },
+	{ 1018, 1, { { 1, 1390, 214 } } },
+	{ 1066, 1, { { 1, 1357, 215 } } },
+	{ 1076, 1, { { 1, 1331, 215 } } },
+	{ 1085, 1, { { 1, 1295, 216 } } },
+	{ 1095, 1, { { 1, 1236, 217 } } },
+	{ 1105, 1, { { 1, 1203, 218 } } },
+	{ 1114, 1, { { 1, 1178, 219 } } },
+	{ 1133, 1, { { 1, 1137, 221 } } },
+	{ 1153, 1, { { 1, 1109, 222 } } },
+	{ 1172, 1, { { 1, 1243, 228 } } },
+	{ 1181, 1, { { 1, 1278, 228 } } },
+	{ 1201, 2, { { 0, 717, 347 }, { 1, 1313, 218 } } },
+	{ 1230, 2, { { 0, 669, 341 }, { 1, 1336, 206 } } },
+	{ 1239, 2, { { 0, 626, 337 }, { 1, 1341, 203 } } },
+	{ 1249, 2, { { 0, 580, 332 }, { 1, 1345, 201 } } },
+	{ 1259, 2, { { 0, 533, 329 }, { 1, 1348, 199 } } },
+	{ 1269, 2, { { 0, 495, 329 }, { 1, 1351, 198 } } },
+	{ 1278, 2, { { 0, 460, 323 }, { 1, 1353, 197 } } },
+	{ 1287, 2, { { 0, 416, 323 }, { 1, 1355, 196 } } },
+	{ 1297, 2, { { 0, 370, 324 }, { 1, 1357, 195 } } },
+};
+
+static void test_recorded_resting_thumb(void)
+{
+	int first, live = 0, finger_live_at = -1;
+	pad_reset();
+	live_reset();
+	for (size_t f = 0; f < sizeof rec / sizeof *rec; f++) {
+		for (int c = 0; c < rec[f].n; c++)
+			mtk_contact(rec[f].c[c].id, rec[f].c[c].x, rec[f].c[c].y);
+		if (!rec[f].n)
+			mtk_lift();
+		else
+			pfeed(EV_SYN, SYN_REPORT, 0);
+		for (int i = 0; i < SLOTS; i++) {
+			lid[i] = pid[i];
+			if (pid[i] < 0)
+				continue;
+			if (pfresh[i]) {
+				llanded[i] = 1;
+				lsx[i] = prx[i]; lsy[i] = pry[i];
+				ldown[i] = rec[f].ms;
+			}
+			lx[i] = prx[i]; ly[i] = pry[i];
+		}
+		consume_fresh();
+		live = lframe(-1, rec[f].ms, &first);
+		if (rec[f].n == 1 && rec[f].c[0].id == 1) {
+			CHECK(pid[1] == 1);	/* the thumb kept its slot */
+			CHECK(live == 0);	/* and is resting */
+		}
+		if (live && finger_live_at < 0 && rec[f].ms > 1000)
+			finger_live_at = rec[f].ms;
+	}
+	CHECK(finger_live_at == 1201);		/* the finger, as it lands */
+	CHECK(live == 1 && first == 0);
+	CHECK(lrest[1] == 1);
+}
+
 int main(void)
 {
 	test_pad_typea_lift();
@@ -509,6 +801,16 @@ int main(void)
 	test_pad_typea_sparse();
 	test_pad_typea_min();
 	test_pad_typea_overflow();
+	test_pad_typea_keeps_slot();
+	test_pad_typea_reordered();
+	test_pad_typea_missing_axis();
+	test_pad_typea_missing_axis_reordered();
+	test_rest_when_another_lands();
+	test_driver_does_not_rest();
+	test_rest_when_another_lifts();
+	test_rest_by_time();
+	test_rest_cleared_by_landing();
+	test_recorded_resting_thumb();
 	test_typea_down_frame();
 	test_typea_move_frame();
 	test_typea_lift_frame();

@@ -21,7 +21,9 @@ or compositor support. Each slide is locked to the axis it starts on: an up
 or down slide drags from the middle of the screen, a sideways one from the
 edge it moves away from, so a pager has the whole width to travel. Typing
 always wins: a key press during a slide, or just before it, cancels the
-gesture. With the cursor modifier held (Alt by default) the same slide sends
+gesture. A contact that only rests on the surface - the thumb holding the
+phone - is ignored rather than taken for a second finger. With the cursor
+modifier held (Alt by default) the same slide sends
 arrow keys instead, which moves the text cursor.
 
 Nothing is device-specific. The input devices are found by capability and
