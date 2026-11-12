@@ -42,9 +42,10 @@
  * the mounting with pad-rotate / pad-invert-x / pad-invert-y, and only then
  * touch scale and slop.
  *
- * Absolute surfaces - multitouch protocol B, and single-touch ABS_X/ABS_Y with
- * BTN_TOUCH - are the natural input here, because a stroke arrives with its own
- * beginning and end.
+ * Absolute surfaces - multitouch protocol B, multitouch protocol A (no slots,
+ * a lift being a frame with no contact in it: the Titan's mtk-pad), and
+ * single-touch ABS_X/ABS_Y with BTN_TOUCH - are the natural input here,
+ * because a stroke arrives with its own beginning and end.
  *
  * A relative (mouse-like) pad is read too, and the reason is worth stating
  * because it was once excluded. The old argument was that the compositor turns
