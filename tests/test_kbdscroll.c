@@ -582,11 +582,13 @@ static void test_pad_typea_missing_axis_reordered(void)
 static int lid[SLOTS], llanded[SLOTS], lwas[SLOTS], lx[SLOTS], ly[SLOTS];
 static int lsx[SLOTS], lsy[SLOTS], lfar[SLOTS], lrest[SLOTS];
 static long long ldown[SLOTS];
+static int lkeys;	/* a key is held */
 
 static void live_reset(void)
 {
 	o_slop = 72;
 	o_rest_ms = 400;
+	lkeys = 0;
 	for (int i = 0; i < SLOTS; i++) {
 		lid[i] = -1;
 		llanded[i] = lwas[i] = lfar[i] = lrest[i] = 0;
@@ -610,7 +612,7 @@ static void ldown_at(int i, int x, int y, long long now)
 static int lframe(int driver, long long now, int *first)
 {
 	int n = live_contacts(lid, llanded, lwas, lx, ly, lsx, lsy, ldown,
-			      lfar, lrest, driver, now, first);
+			      lfar, lrest, driver, lkeys, now, first);
 	for (int i = 0; i < SLOTS; i++)
 		llanded[i] = 0;
 	return n;
@@ -708,6 +710,34 @@ static void test_rest_cleared_by_landing(void)
 	ldown_at(0, 300, 300, 520);
 	CHECK(lframe(-1, 520, &first) == 1 && first == 0);
 	CHECK(lrest[0] == 0);
+}
+
+/* While a key is held every contact rests, the one driving a slide too,
+ * and those that land meanwhile; they stay resting once it is let go. A
+ * contact that lands after the release is live. */
+static void test_rest_while_a_key_is_held(void)
+{
+	int first;
+	live_reset();
+	ldown_at(0, 700, 400, 0);
+	lframe(-1, 0, &first);
+	ldown_at(0, 600, 400, 30);
+	CHECK(lframe(-1, 30, &first) == 1);
+	lkeys = 1;
+	ldown_at(0, 500, 400, 40);
+	CHECK(lframe(0, 40, &first) == 0 && first == -1);
+	CHECK(lrest[0] == 1);
+	ldown_at(1, 1, 450, 50);		/* a phantom while backspace is held */
+	CHECK(lframe(-1, 50, &first) == 0);
+	CHECK(lrest[1] == 1);
+	lkeys = 0;
+	ldown_at(0, 300, 400, 60);
+	ldown_at(1, 1, 1, 60);
+	CHECK(lframe(-1, 60, &first) == 0);
+	lid[0] = lid[1] = -1;
+	lframe(-1, 70, &first);
+	ldown_at(0, 700, 300, 80);
+	CHECK(lframe(-1, 80, &first) == 1 && first == 0);
 }
 
 /* Recorded on the Titan (12 Nov 2026), 0.72 s to 1.30 s of a capture: a
@@ -810,6 +840,7 @@ int main(void)
 	test_rest_when_another_lifts();
 	test_rest_by_time();
 	test_rest_cleared_by_landing();
+	test_rest_while_a_key_is_held();
 	test_recorded_resting_thumb();
 	test_typea_down_frame();
 	test_typea_move_frame();
