@@ -823,6 +823,132 @@ static void test_recorded_resting_thumb(void)
 	CHECK(lrest[1] == 1);
 }
 
+/* The Titan Pocket's geometry as kbdscroll logs it at start on the hardware:
+ * pad "Synaptics 63022-001" 721x361. */
+static void slop_pocket(void)
+{
+	o_slop = 361 / 10;	/* 36 */
+	o_slop_x = 721 / 4;	/* 180 */
+}
+
+/* The brush that cancelled fingerprint enrolment (15 Nov 2026, "Synaptics
+ * 63022-001"): a contact landing at 326,156 and sliding to 264,140 before it
+ * came back. Past the slop, so it is a sideways slide - but too short to put a
+ * drag on the screen. */
+static void test_recorded_brush_starts_nothing(void)
+{
+	static const int path[][2] = {
+		{ 326, 156 }, { 306, 151 }, { 300, 149 }, { 292, 148 }, { 278, 146 },
+		{ 285, 144 }, { 272, 142 }, { 264, 140 }, { 272, 142 }, { 265, 141 },
+		{ 272, 140 }, { 277, 140 }, { 269, 140 }, { 275, 140 }, { 281, 141 },
+		{ 288, 142 },
+	};
+	int runs = 0;
+	slop_pocket();
+	for (size_t i = 0; i < sizeof path / sizeof *path; i++) {
+		int dx = path[i][0] - path[0][0], dy = path[i][1] - path[0][1];
+		int axis = slide_axis(dx, dy);
+		CHECK(axis == 0 || axis == 'x');
+		CHECK(!(axis == 'x' && side_drag_ready(dx, &runs)));
+	}
+	CHECK(slide_axis(264 - 326, 140 - 156) == 'x');	/* it was a slide */
+}
+
+/* Past slop-x for two reports running, not one. */
+static void test_side_drag_needs_slop_x(void)
+{
+	int runs = 0;
+	slop_pocket();
+	CHECK(!side_drag_ready(179, &runs) && !side_drag_ready(-179, &runs));
+	CHECK(!side_drag_ready(180, &runs));
+	CHECK(side_drag_ready(-180, &runs));
+	CHECK(side_drag_ready(-300, &runs));
+	CHECK(!side_drag_ready(-100, &runs));	/* fell back: start over */
+	CHECK(!side_drag_ready(-200, &runs));
+	CHECK(side_drag_ready(-200, &runs));
+}
+
+/* The hop that still cancelled enrolment with slop-x alone (15 Nov 2026): the
+ * contact landed at 512 and read 250 once, then 443 on. One report past
+ * slop-x is not a slide. */
+static void test_recorded_spike_starts_nothing(void)
+{
+	static const int xs[] = { 512, 250, 443, 454, 461, 467, 472 };
+	int runs = 0;
+	slop_pocket();
+	for (size_t i = 0; i < sizeof xs / sizeof *xs; i++)
+		CHECK(!side_drag_ready(xs[i] - xs[0], &runs));
+}
+
+static int last_x_before_lift(const struct cap *c)
+{
+	int x = -1;
+	for (int i = 0; i < c->n; i++) {
+		if (c->ev[i].type == EV_ABS && c->ev[i].code == ABS_MT_POSITION_X)
+			x = c->ev[i].value;
+		if (c->ev[i].type == EV_KEY && c->ev[i].code == BTN_TOUCH && !c->ev[i].value)
+			break;
+	}
+	return x;
+}
+
+/* A sideways drag that came back near where it landed lets go a quarter of
+ * the screen away from it, not on the button it pressed. */
+static void test_side_lift_clear(void)
+{
+	reset(1, 0);
+	int g = side_clear();
+	CHECK(g == 180);
+
+	/* The recorded drag: down at 649, out to 256, back to 589. */
+	inj_touch(649, 360);
+	inj_clear = g;
+	inj_touch(256, 360);
+	inj_touch(589, 360);
+	drain();
+	inj_up();
+	struct cap c = drain();
+	CHECK(last_x_before_lift(&c) == 649 - g);
+	CHECK(count(&c, EV_KEY, BTN_TOUCH, 0, 0) == 1);
+
+	/* Gone far enough: let go where it is. */
+	inj_touch(649, 360);
+	inj_clear = g;
+	inj_touch(400, 360);
+	drain();
+	inj_up();
+	c = drain();
+	CHECK(count(&c, EV_ABS, ABS_MT_POSITION_X, 0, 1) == 0);
+
+	/* Never moved: away from the nearer edge. */
+	inj_touch(72, 360);
+	inj_clear = g;
+	drain();
+	inj_up();
+	c = drain();
+	CHECK(last_x_before_lift(&c) == 72 + g);
+
+	/* The next contact is not sideways: back to the tap guard. */
+	inj_touch(360, 360);
+	CHECK(inj_clear == 0);
+	drain();
+	inj_up();
+	c = drain();
+	CHECK(count(&c, EV_ABS, ABS_MT_POSITION_Y, 360 + tap_guard(), 0) == 1);
+}
+
+/* Up and down keep the short slop, and the axis still locks to the larger
+ * movement. */
+static void test_vertical_keeps_slop(void)
+{
+	slop_pocket();
+	CHECK(slide_axis(0, 35) == 0);
+	CHECK(slide_axis(0, 36) == 'y');
+	CHECK(slide_axis(5, -40) == 'y');
+	CHECK(slide_axis(40, 39) == 'x');
+	CHECK(slide_axis(35, 35) == 0);
+}
+
 int main(void)
 {
 	test_pad_typea_lift();
@@ -842,6 +968,11 @@ int main(void)
 	test_rest_cleared_by_landing();
 	test_rest_while_a_key_is_held();
 	test_recorded_resting_thumb();
+	test_recorded_brush_starts_nothing();
+	test_side_drag_needs_slop_x();
+	test_recorded_spike_starts_nothing();
+	test_side_lift_clear();
+	test_vertical_keeps_slop();
 	test_typea_down_frame();
 	test_typea_move_frame();
 	test_typea_lift_frame();

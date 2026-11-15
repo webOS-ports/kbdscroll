@@ -114,7 +114,7 @@ static char *o_text_focus = "";
 static char *o_backlight = "auto";
 static int o_pad_rotate, o_invert_x, o_invert_y;
 static double o_scale, o_scale_x, o_gain = 1.0, o_gain_x = 1.5;
-static int o_slop, o_typing_ms = 300, o_horizontal = 1, o_rest_ms = 400;
+static int o_slop, o_slop_x, o_typing_ms = 300, o_horizontal = 1, o_rest_ms = 400;
 static int o_step_x, o_step_y;
 static int o_rel_lift = 120, o_rel_w, o_rel_h;
 static int o_debug;
@@ -145,6 +145,7 @@ static const struct {
 { "gain",	    O_DBL, &o_gain,	   "multiplier behind an automatic scale" },
 { "gain-x",	    O_DBL, &o_gain_x,	   "multiplier behind an automatic scale-x" },
 { "slop",	    O_INT, &o_slop,	   "pad units before a touch counts as a slide (0: a tenth of the pad)" },
+{ "slop-x",	    O_INT, &o_slop_x,	   "pad units before a sideways slide moves the screen (0: a quarter of the pad's width)" },
 { "typing-ms",	    O_INT, &o_typing_ms,   "quiet time after a key press or release before a touch may scroll" },
 { "rest-ms",	    O_INT, &o_rest_ms,	   "a contact still for this long is resting, not sliding (0: off)" },
 { "horizontal",	    O_INT, &o_horizontal,  "0 to ignore sideways slides" },
@@ -607,8 +608,55 @@ static void emit(int fd, int type, int code, int value)
 	if (fd >= 0 && write(fd, &e, sizeof e) < 0) { /* nothing useful to do */ }
 }
 
+/* Which way a contact that has moved (dx, dy) on the pad since it landed is
+ * sliding: 'x' or 'y', locked to the axis it moved along most, or 0 while it
+ * has not moved a slop either way. */
+static int slide_axis(int dx, int dy)
+{
+	if (abs(dx) < o_slop && abs(dy) < o_slop)
+		return 0;
+	return abs(dx) > abs(dy) ? 'x' : 'y';
+}
+
+/*
+ * Whether a sideways slide has come far enough to move the screen.
+ *
+ * A sideways drag comes down near the screen's edge, half way up, on whatever
+ * is there, and nothing takes it over: a list only steals a contact that moves
+ * along it. So a button under it is pressed, and clicked when the drag lets go
+ * still inside it - however far it went in between. On the Titan Pocket that
+ * spot is the Settings fingerprint page's Cancel button: fingers brushing the
+ * keys while the other hand's finger was on the sensor slid 60-odd pad units
+ * sideways, past the slop, and enrolment was cancelled every few tries
+ * (recorded 15 Nov 2026). A slide that means it travels a good part of the
+ * surface; until then it starts nothing.
+ *
+ * And it has to stay there for two reports running. The pad hops: a contact
+ * landing at x 512 read 250 once, 10 ms later, and 443 after that - one
+ * sample past slop-x, which started a drag that came back with the finger and
+ * let go on the same button. *runs counts the reports in a row that were far
+ * enough; the caller zeroes it when a contact lands.
+ */
+static int side_drag_ready(int dx, int *runs)
+{
+	if (abs(dx) < o_slop_x) {
+		*runs = 0;
+		return 0;
+	}
+	return ++*runs >= 2;
+}
+
+/* How far from where it came down a sideways drag lets go, at the least: a
+ * quarter of the screen, wider than a button. The tap guard's few pixels keep
+ * the shell from seeing a tap but not a button from seeing a click. */
+static int side_clear(void)
+{
+	return scr_w / 4;
+}
+
 static int inj_down;
 static int inj_x0, inj_y0, inj_lx, inj_ly;	/* where it came down, where it is */
+static int inj_clear;	/* least distance from inj_x0 to let go at; 0: tap_guard() */
 
 /* Screen pixels an injected contact must have moved before it may lift: a
  * contact that goes down and up on the spot is a tap to the shell. */
@@ -624,7 +672,7 @@ static void inj_touch(int x, int y)
 	/* The stream belongs to the finger on the glass. */
 	if (scr_shared && real_down)
 		return;
-	if (!inj_down) { inj_x0 = x; inj_y0 = y; }
+	if (!inj_down) { inj_x0 = x; inj_y0 = y; inj_clear = 0; }
 	inj_lx = x;
 	inj_ly = y;
 	if (scr_typea) {
@@ -684,11 +732,15 @@ static void inj_up(void)
 	}
 	/* Never end as a tap: a drag that is let go almost where it came down
 	 * is first carried on in the direction it was going (down if it has
-	 * none). */
-	int dx = inj_lx - inj_x0, dy = inj_ly - inj_y0, g = tap_guard();
-	if (abs(dx) < g && abs(dy) < g) {
+	 * none). A sideways drag goes sideways, by side_clear() at least, and
+	 * with no direction away from the nearer edge. */
+	int dx = inj_lx - inj_x0, dy = inj_ly - inj_y0;
+	int g = inj_clear > 0 ? inj_clear : tap_guard();
+	if (abs(dx) < g && (inj_clear > 0 || abs(dy) < g)) {
 		int nx = inj_x0, ny = inj_y0;
-		if (abs(dx) > abs(dy))
+		if (inj_clear > 0 && dx == 0)
+			nx += inj_x0 > scr_w / 2 ? -g : g;
+		else if (inj_clear > 0 || abs(dx) > abs(dy))
 			nx += dx < 0 ? -g : g;
 		else
 			ny += dy < 0 ? -g : g;
@@ -1111,8 +1163,8 @@ static void list_devices(const struct indev *pad, const struct indev *scr,
 		if (o_pad_rotate || o_invert_x || o_invert_y)
 			printf(" -> %dx%d (rotate %d%s%s)", pad_w, pad_h, o_pad_rotate,
 			       o_invert_x ? " invert-x" : "", o_invert_y ? " invert-y" : "");
-		printf(", screen %dx%d, scale %.2f/%.2f, slop %d, cursor step %d/%d\n",
-		       scr_w, scr_h, o_scale, o_scale_x, o_slop, o_step_x, o_step_y);
+		printf(", screen %dx%d, scale %.2f/%.2f, slop %d/%d, cursor step %d/%d\n",
+		       scr_w, scr_h, o_scale, o_scale_x, o_slop, o_slop_x, o_step_x, o_step_y);
 	}
 	printf("backlight: %s\n", *backlight_path ? backlight_path : "(none: always treated as on)");
 }
@@ -1296,6 +1348,8 @@ int main(int argc, char **argv)
 	if (o_scale <= 0)   o_scale = (double)scr_h / (pad_h ? pad_h : scr_h) * o_gain;
 	if (o_scale_x <= 0) o_scale_x = (double)scr_w / (pad_w ? pad_w : scr_w) * o_gain_x;
 	if (o_slop <= 0)    o_slop = pad_h ? pad_h / 10 : 50;
+	if (o_slop_x <= 0)  o_slop_x = pad_w ? pad_w / 4 : 4 * o_slop;
+	if (o_slop_x < o_slop) o_slop_x = o_slop;
 	if (o_step_y <= 0)  o_step_y = pad_h ? pad_h / 5 : 100;
 	if (o_step_x <= 0)  o_step_x = pad_w ? pad_w / 24 : 45;
 
@@ -1367,11 +1421,11 @@ int main(int argc, char **argv)
 	/* A multitouch surface with no slots speaks protocol A. */
 	const int pad_typea = pad->mt && pad->slots < 0;
 
-	note("kbdscroll: pad \"%s\" %dx%d%s -> screen \"%s\" %dx%d%s, scale %.2f/%.2f, slop %d\n",
+	note("kbdscroll: pad \"%s\" %dx%d%s -> screen \"%s\" %dx%d%s, scale %.2f/%.2f, slop %d/%d\n",
 	     pad->name, pad_w, pad_h, pad_typea ? " (protocol A)" : "",
 	     uinput_scr_fd >= 0 ? "kbdscroll touch" : scr ? scr->name : "?",
 	     scr_w, scr_h, scr_typea ? " (protocol A)" : scr_shared ? " (one slot)" : "",
-	     o_scale, o_scale_x, o_slop);
+	     o_scale, o_scale_x, o_slop, o_slop_x);
 	for (int i = 0; i < nkeyd; i++)
 		dbg("watching keys on %s (%s)\n", keyd[i]->path, keyd[i]->name);
 
@@ -1393,7 +1447,7 @@ int main(int argc, char **argv)
 	long long down_at[SLOTS], t_down = 0;
 	int slot = 0;
 	long long last_key = 0;
-	int tracking = 0, rejected = 0, scrolling = 0;
+	int tracking = 0, rejected = 0, scrolling = 0, side_runs = 0;
 	/* Relative pads only: whether a synthesised contact is down, and when it
 	 * last moved. Stillness is the lift, so the loop has to wake up to notice
 	 * it - see the poll timeout below. */
@@ -1653,6 +1707,7 @@ int main(int argc, char **argv)
 			if (live == 1) {
 				tracking = 1;
 				scrolling = 0;
+				side_runs = 0;
 				t_slot = lfirst;
 				t_down = down_at[lfirst];
 				x0 = x[lfirst];
@@ -1691,10 +1746,10 @@ int main(int argc, char **argv)
 
 		int dx = x[t_slot] - x0, dy = y[t_slot] - y0;
 		if (!scrolling) {
-			if (abs(dx) < o_slop && abs(dy) < o_slop)
+			int way = slide_axis(dx, dy);
+			if (!way)
 				continue;
-			/* lock the slide to the axis it started on */
-			scroll_axis = abs(dx) > abs(dy) ? 'x' : 'y';
+			scroll_axis = way;
 			if (scroll_axis == 'x' && !o_horizontal) {
 				rejected = 1;
 				continue;
@@ -1709,6 +1764,10 @@ int main(int argc, char **argv)
 				rejected = 1;	/* one word per slide */
 				continue;
 			}
+			/* The word delete above writes a key, not a touch, so it
+			 * keeps the short slop; a drag waits for slop-x. */
+			if (scroll_axis == 'x' && !side_drag_ready(dx, &side_runs))
+				continue;
 			if (scr_shared && real_down) {
 				dbg("slide while a finger is on the screen: ignored\n");
 				rejected = 1;
@@ -1732,6 +1791,7 @@ int main(int argc, char **argv)
 				anchor_y = scr_h / 2;
 				pad_anchor = x0;
 				inj_touch(anchor_x, anchor_y);
+				inj_clear = side_clear();
 			}
 		}
 
